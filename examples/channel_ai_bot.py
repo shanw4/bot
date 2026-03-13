@@ -6,8 +6,8 @@ This script demonstrates how to create a simple AI assistant that listens
 to Open WebUI channel events and responds when a message begins with "AI:".
 
 The bot connects to the Open WebUI websocket, authenticates using a JWT,
-listens for channel events, and sends prompts to the Open WebUI
-`/api/chat/completions` endpoint.
+listens for channel events, fetches recent channel history for context,
+and sends prompts to the Open WebUI `/api/chat/completions` endpoint.
 
 Trigger format in a channel:
 
@@ -32,6 +32,8 @@ Notes
 - API keys (sk-...) will not work for websocket channel participation.
 - The bot listens for the `events:channel` websocket event.
 - Messages not beginning with "AI:" are ignored.
+- The bot fetches the last HISTORY_LIMIT messages from the channel to
+  provide context and will cite relevant parts of the discussion.
 """
 
 import asyncio
@@ -42,6 +44,7 @@ from env import WEBUI_URL, TOKEN
 from utils import send_message, send_typing
 
 MODEL_ID = "your-model-id"
+HISTORY_LIMIT = 50
 
 sio = socketio.AsyncClient(logger=False, engineio_logger=False)
 
@@ -54,6 +57,32 @@ async def connect():
 @sio.event
 async def disconnect():
     print("Disconnected from Open WebUI.")
+
+
+async def get_channel_messages(channel_id: str, limit: int = HISTORY_LIMIT) -> list:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{WEBUI_URL}/api/v1/channels/{channel_id}/messages",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            params={"limit": limit},
+        ) as response:
+            if response.status == 200:
+                data = await response.json()
+                # API returns messages newest-first; reverse for chronological order
+                messages = data if isinstance(data, list) else data.get("messages", [])
+                return list(reversed(messages))
+            return []
+
+
+def format_history(messages: list) -> str:
+    lines = []
+    for msg in messages:
+        user = msg.get("user", {})
+        name = user.get("name") or user.get("username") or msg.get("user_id", "unknown")
+        content = (msg.get("content") or "").strip()
+        if content:
+            lines.append(f"{name}: {content}")
+    return "\n".join(lines)
 
 
 async def openai_chat_completion(messages):
@@ -115,14 +144,25 @@ def register_events():
                 task.cancel()
                 raise
 
+        history = await get_channel_messages(channel_id)
+        history_text = format_history(history)
+
+        system_content = (
+            "You are a helpful assistant responding in a shared team channel. "
+            "Be concise and clear.\n\n"
+            "When answering, use the conversation history below as context. "
+            "If any prior messages are relevant to your answer, quote or cite them "
+            "directly (e.g. \"As [Name] mentioned: '...'\").\n\n"
+            f"--- Recent channel history ({len(history)} messages) ---\n"
+            f"{history_text}\n"
+            "--- End of history ---"
+        )
+
         completion_task = openai_chat_completion(
             [
                 {
                     "role": "system",
-                    "content": (
-                        "You are a helpful assistant responding in a shared "
-                        "team channel. Be concise and clear."
-                    ),
+                    "content": system_content,
                 },
                 {
                     "role": "user",
@@ -151,33 +191,40 @@ def register_events():
             )
 
 
+async def connect_and_run():
+    """Attempt a single connect + auth + wait cycle. Raises on failure."""
+    if sio.connected:
+        await sio.disconnect()
+
+    print(f"Connecting to {WEBUI_URL}...")
+    await sio.connect(
+        WEBUI_URL,
+        socketio_path="/ws/socket.io",
+        transports=["websocket"],
+    )
+    print("Connection established.")
+
+    await sio.call("user-join", {"auth": {"token": TOKEN}}, timeout=10)
+    print("Authentication successful.")
+
+    await sio.wait()  # blocks until disconnected
+
+
 async def main():
     register_events()
 
-    try:
-        print(f"Connecting to {WEBUI_URL}...")
+    delay = 5
+    max_delay = 300  # cap backoff at 5 minutes
 
-        await sio.connect(
-            WEBUI_URL,
-            socketio_path="/ws/socket.io",
-            transports=["websocket"],
-        )
+    while True:
+        try:
+            await connect_and_run()
+        except Exception as exc:
+            print(f"Connection lost: {exc}")
 
-        print("Connection established.")
-
-    except Exception as exc:
-        print(f"Failed to connect: {exc}")
-        return
-
-    try:
-        await sio.call("user-join", {"auth": {"token": TOKEN}}, timeout=10)
-        print("Authentication successful.")
-
-    except Exception as exc:
-        print(f"Failed to authenticate: {exc}")
-        return
-
-    await sio.wait()
+        print(f"Reconnecting in {delay}s...")
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, max_delay)
 
 
 if __name__ == "__main__":
