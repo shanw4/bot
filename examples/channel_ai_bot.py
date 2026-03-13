@@ -71,6 +71,7 @@ async def get_channel_messages(channel_id: str, limit: int = HISTORY_LIMIT) -> l
                 # API returns messages newest-first; reverse for chronological order
                 messages = data if isinstance(data, list) else data.get("messages", [])
                 return list(reversed(messages))
+            print(f"Failed to fetch channel history: HTTP {response.status}")
             return []
 
 
@@ -219,6 +220,7 @@ async def main():
     while True:
         try:
             await connect_and_run()
+            delay = 5  # reset backoff after a successful connection
         except Exception as exc:
             print(f"Connection lost: {exc}")
 
